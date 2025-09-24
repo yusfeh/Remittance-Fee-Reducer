@@ -15,17 +15,24 @@
 (define-constant ERR_AGENT_NOT_FOUND (err u108))
 (define-constant ERR_ALREADY_REGISTERED (err u109))
 (define-constant ERR_INVALID_EXCHANGE_RATE (err u110))
+(define-constant ERR_INSUFFICIENT_LIQUIDITY (err u111))
+(define-constant ERR_CURRENCY_NOT_SUPPORTED (err u112))
+(define-constant ERR_EXCHANGE_SLIPPAGE (err u113))
 
 (define-constant MIN_TRANSFER_AMOUNT u1000000)
 (define-constant MAX_TRANSFER_AMOUNT u100000000000)
 (define-constant BASE_FEE_RATE u250)
 (define-constant AGENT_COMMISSION_RATE u100)
 (define-constant ESCROW_TIMEOUT_BLOCKS u1008)
+(define-constant EXCHANGE_FEE_RATE u50)
+(define-constant MAX_SLIPPAGE_RATE u500)
+(define-constant MIN_LIQUIDITY_THRESHOLD u100000000)
 
 (define-data-var next-transfer-id uint u1)
 (define-data-var contract-paused bool false)
 (define-data-var total-volume uint u0)
 (define-data-var total-fees-collected uint u0)
+(define-data-var next-exchange-id uint u1)
 
 (define-map transfers uint {
     sender: principal,
@@ -63,6 +70,27 @@
     disputer: principal,
     reason: (string-ascii 256),
     created-at: uint
+})
+
+(define-map currency-pools (string-ascii 3) {
+    total-liquidity: uint,
+    available-liquidity: uint,
+    exchange-volume: uint,
+    last-updated: uint,
+    active: bool
+})
+
+(define-map exchange-transactions uint {
+    sender: principal,
+    recipient: principal,
+    source-amount: uint,
+    target-amount: uint,
+    source-currency: (string-ascii 3),
+    target-currency: (string-ascii 3),
+    exchange-rate-used: uint,
+    exchange-fee: uint,
+    created-at: uint,
+    status: (string-ascii 20)
 })
 
 (define-public (register-user (kyc-verified bool))
@@ -447,6 +475,171 @@
         )
         (ok true)
     )
+)
+
+(define-public (create-currency-pool (currency (string-ascii 3)) (initial-liquidity uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> initial-liquidity MIN_LIQUIDITY_THRESHOLD) ERR_INSUFFICIENT_LIQUIDITY)
+        (asserts! (is-none (map-get? currency-pools currency)) ERR_ALREADY_REGISTERED)
+        (map-set currency-pools currency {
+            total-liquidity: initial-liquidity,
+            available-liquidity: initial-liquidity,
+            exchange-volume: u0,
+            last-updated: stacks-block-height,
+            active: true
+        })
+        (ok true)
+    )
+)
+
+(define-public (add-liquidity (currency (string-ascii 3)) (amount uint))
+    (let (
+        (pool-data (unwrap! (map-get? currency-pools currency) ERR_CURRENCY_NOT_SUPPORTED))
+        (provider tx-sender)
+    )
+        (asserts! (is-eq provider CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (get active pool-data) ERR_CURRENCY_NOT_SUPPORTED)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (map-set currency-pools currency {
+            total-liquidity: (+ (get total-liquidity pool-data) amount),
+            available-liquidity: (+ (get available-liquidity pool-data) amount),
+            exchange-volume: (get exchange-volume pool-data),
+            last-updated: stacks-block-height,
+            active: true
+        })
+        (ok true)
+    )
+)
+
+(define-public (remove-liquidity (currency (string-ascii 3)) (amount uint))
+    (let (
+        (pool-data (unwrap! (map-get? currency-pools currency) ERR_CURRENCY_NOT_SUPPORTED))
+        (provider tx-sender)
+    )
+        (asserts! (is-eq provider CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (get active pool-data) ERR_CURRENCY_NOT_SUPPORTED)
+        (asserts! (>= (get available-liquidity pool-data) amount) ERR_INSUFFICIENT_LIQUIDITY)
+        (map-set currency-pools currency {
+            total-liquidity: (- (get total-liquidity pool-data) amount),
+            available-liquidity: (- (get available-liquidity pool-data) amount),
+            exchange-volume: (get exchange-volume pool-data),
+            last-updated: stacks-block-height,
+            active: (> (- (get total-liquidity pool-data) amount) MIN_LIQUIDITY_THRESHOLD)
+        })
+        (ok true)
+    )
+)
+
+(define-public (exchange-transfer (recipient principal) (stx-amount uint) (target-currency (string-ascii 3)) (min-expected-amount uint))
+    (let (
+        (sender tx-sender)
+        (exchange-id (var-get next-exchange-id))
+        (exchange-pair (unwrap! (construct-currency-pair "STX" target-currency) ERR_CURRENCY_NOT_SUPPORTED))
+        (exchange-rate (unwrap! (map-get? exchange-rates exchange-pair) ERR_INVALID_EXCHANGE_RATE))
+        (pool-data (unwrap! (map-get? currency-pools target-currency) ERR_CURRENCY_NOT_SUPPORTED))
+        (target-amount (calculate-exchange-amount stx-amount exchange-rate))
+        (exchange-fee (calculate-exchange-fee stx-amount))
+        (total-cost (+ stx-amount exchange-fee))
+        (slippage (calculate-slippage target-amount min-expected-amount))
+    )
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (not (is-eq sender recipient)) ERR_INVALID_RECIPIENT)
+        (asserts! (and (>= stx-amount MIN_TRANSFER_AMOUNT) (<= stx-amount MAX_TRANSFER_AMOUNT)) ERR_INVALID_AMOUNT)
+        (asserts! (>= (stx-get-balance sender) total-cost) ERR_INSUFFICIENT_BALANCE)
+        (asserts! (get active pool-data) ERR_CURRENCY_NOT_SUPPORTED)
+        (asserts! (>= (get available-liquidity pool-data) target-amount) ERR_INSUFFICIENT_LIQUIDITY)
+        (asserts! (<= slippage MAX_SLIPPAGE_RATE) ERR_EXCHANGE_SLIPPAGE)
+        (asserts! (>= target-amount min-expected-amount) ERR_EXCHANGE_SLIPPAGE)
+        
+        (try! (stx-transfer? total-cost sender (as-contract tx-sender)))
+        
+        (map-set exchange-transactions exchange-id {
+            sender: sender,
+            recipient: recipient,
+            source-amount: stx-amount,
+            target-amount: target-amount,
+            source-currency: "STX",
+            target-currency: target-currency,
+            exchange-rate-used: exchange-rate,
+            exchange-fee: exchange-fee,
+            created-at: stacks-block-height,
+            status: "completed"
+        })
+        
+        (map-set currency-pools target-currency {
+            total-liquidity: (get total-liquidity pool-data),
+            available-liquidity: (- (get available-liquidity pool-data) target-amount),
+            exchange-volume: (+ (get exchange-volume pool-data) target-amount),
+            last-updated: stacks-block-height,
+            active: (get active pool-data)
+        })
+        
+        (var-set next-exchange-id (+ exchange-id u1))
+        (var-set total-volume (+ (var-get total-volume) stx-amount))
+        (var-set total-fees-collected (+ (var-get total-fees-collected) exchange-fee))
+        
+        (update-user-stats sender recipient stx-amount)
+        (ok exchange-id)
+    )
+)
+
+(define-private (construct-currency-pair (from-currency (string-ascii 3)) (to-currency (string-ascii 3)))
+    (let ((pair (concat from-currency to-currency)))
+        (if (is-eq (len pair) u6)
+            (some pair)
+            none
+        )
+    )
+)
+
+(define-private (calculate-exchange-amount (amount uint) (exchange-rate uint))
+    (/ (* amount exchange-rate) u1000000)
+)
+
+(define-private (calculate-exchange-fee (amount uint))
+    (let ((base-fee (/ (* amount EXCHANGE_FEE_RATE) u10000)))
+        (if (< base-fee u5000) u5000 base-fee)
+    )
+)
+
+(define-private (calculate-slippage (expected uint) (actual uint))
+    (if (> expected actual)
+        (/ (* (- expected actual) u10000) expected)
+        u0
+    )
+)
+
+(define-read-only (get-exchange-quote (stx-amount uint) (target-currency (string-ascii 3)))
+    (let (
+        (exchange-pair (unwrap! (construct-currency-pair "STX" target-currency) ERR_CURRENCY_NOT_SUPPORTED))
+        (exchange-rate (unwrap! (map-get? exchange-rates exchange-pair) ERR_INVALID_EXCHANGE_RATE))
+        (pool-data (unwrap! (map-get? currency-pools target-currency) ERR_CURRENCY_NOT_SUPPORTED))
+        (target-amount (calculate-exchange-amount stx-amount exchange-rate))
+        (exchange-fee (calculate-exchange-fee stx-amount))
+    )
+        (asserts! (get active pool-data) ERR_CURRENCY_NOT_SUPPORTED)
+        (asserts! (>= (get available-liquidity pool-data) target-amount) ERR_INSUFFICIENT_LIQUIDITY)
+        (ok {
+            target-amount: target-amount,
+            exchange-fee: exchange-fee,
+            total-cost: (+ stx-amount exchange-fee),
+            exchange-rate: exchange-rate,
+            available-liquidity: (get available-liquidity pool-data)
+        })
+    )
+)
+
+(define-read-only (get-currency-pool (currency (string-ascii 3)))
+    (map-get? currency-pools currency)
+)
+
+(define-read-only (get-exchange-transaction (exchange-id uint))
+    (map-get? exchange-transactions exchange-id)
+)
+
+(define-read-only (get-supported-currencies)
+    (ok "Supported currencies query requires off-chain indexing")
 )
 
 (register-user false)
