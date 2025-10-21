@@ -18,6 +18,11 @@
 (define-constant ERR_INSUFFICIENT_LIQUIDITY (err u111))
 (define-constant ERR_CURRENCY_NOT_SUPPORTED (err u112))
 (define-constant ERR_EXCHANGE_SLIPPAGE (err u113))
+(define-constant ERR_SCHEDULE_NOT_FOUND (err u114))
+(define-constant ERR_SCHEDULE_INACTIVE (err u115))
+(define-constant ERR_INVALID_INTERVAL (err u116))
+(define-constant ERR_EXECUTION_NOT_DUE (err u117))
+(define-constant ERR_INSUFFICIENT_BUDGET (err u118))
 
 (define-constant MIN_TRANSFER_AMOUNT u1000000)
 (define-constant MAX_TRANSFER_AMOUNT u100000000000)
@@ -33,6 +38,7 @@
 (define-data-var total-volume uint u0)
 (define-data-var total-fees-collected uint u0)
 (define-data-var next-exchange-id uint u1)
+(define-data-var next-schedule-id uint u1)
 
 (define-map transfers uint {
     sender: principal,
@@ -92,6 +98,23 @@
     created-at: uint,
     status: (string-ascii 20)
 })
+
+(define-map recurring-schedules uint {
+    sender: principal,
+    recipient: principal,
+    amount: uint,
+    interval-blocks: uint,
+    next-execution-block: uint,
+    last-execution-block: uint,
+    total-executions: uint,
+    remaining-budget: uint,
+    max-executions: uint,
+    agent: (optional principal),
+    active: bool,
+    created-at: uint
+})
+
+(define-map user-schedules principal (list 50 uint))
 
 (define-public (register-user (kyc-verified bool))
     (let ((user tx-sender))
@@ -640,6 +663,242 @@
 
 (define-read-only (get-supported-currencies)
     (ok "Supported currencies query requires off-chain indexing")
+)
+
+(define-public (create-recurring-schedule (recipient principal) (amount uint) (interval-blocks uint) (max-executions uint) (budget uint) (agent (optional principal)))
+    (let (
+        (sender tx-sender)
+        (schedule-id (var-get next-schedule-id))
+        (calculated-fee (calculate-fee amount))
+        (per-transfer-cost (+ amount calculated-fee))
+        (total-cost (* per-transfer-cost max-executions))
+        (current-block stacks-block-height)
+        (user-schedule-list (default-to (list) (map-get? user-schedules sender)))
+    )
+        (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+        (asserts! (not (is-eq sender recipient)) ERR_INVALID_RECIPIENT)
+        (asserts! (and (>= amount MIN_TRANSFER_AMOUNT) (<= amount MAX_TRANSFER_AMOUNT)) ERR_INVALID_AMOUNT)
+        (asserts! (>= interval-blocks u144) ERR_INVALID_INTERVAL)
+        (asserts! (and (> max-executions u0) (<= max-executions u100)) ERR_INVALID_AMOUNT)
+        (asserts! (>= budget total-cost) ERR_INSUFFICIENT_BUDGET)
+        (asserts! (>= (stx-get-balance sender) budget) ERR_INSUFFICIENT_BALANCE)
+        
+        (match agent
+            some-agent (asserts! (get active (default-to {commission-rate: u0, total-volume: u0, active: false, supported-currencies: (list), reputation: u0} (map-get? agents some-agent))) ERR_AGENT_NOT_FOUND)
+            true
+        )
+        
+        (try! (stx-transfer? budget sender (as-contract tx-sender)))
+        
+        (map-set recurring-schedules schedule-id {
+            sender: sender,
+            recipient: recipient,
+            amount: amount,
+            interval-blocks: interval-blocks,
+            next-execution-block: (+ current-block interval-blocks),
+            last-execution-block: u0,
+            total-executions: u0,
+            remaining-budget: budget,
+            max-executions: max-executions,
+            agent: agent,
+            active: true,
+            created-at: current-block
+        })
+        
+        (let ((updated-list (unwrap! (as-max-len? (append user-schedule-list schedule-id) u50) ERR_INVALID_AMOUNT)))
+            (map-set user-schedules sender updated-list)
+        )
+        
+        (var-set next-schedule-id (+ schedule-id u1))
+        (ok schedule-id)
+    )
+)
+
+(define-public (execute-scheduled-transfer (schedule-id uint))
+    (let (
+        (schedule-data (unwrap! (map-get? recurring-schedules schedule-id) ERR_SCHEDULE_NOT_FOUND))
+        (sender (get sender schedule-data))
+        (recipient (get recipient schedule-data))
+        (amount (get amount schedule-data))
+        (agent (get agent schedule-data))
+        (current-block stacks-block-height)
+        (calculated-fee (calculate-fee amount))
+        (total-cost (+ amount calculated-fee))
+    )
+        (asserts! (get active schedule-data) ERR_SCHEDULE_INACTIVE)
+        (asserts! (>= current-block (get next-execution-block schedule-data)) ERR_EXECUTION_NOT_DUE)
+        (asserts! (< (get total-executions schedule-data) (get max-executions schedule-data)) ERR_TRANSFER_ALREADY_COMPLETED)
+        (asserts! (>= (get remaining-budget schedule-data) total-cost) ERR_INSUFFICIENT_BUDGET)
+        
+        (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+        
+        (match agent
+            some-agent (let ((agent-commission (/ (* calculated-fee AGENT_COMMISSION_RATE) u1000)))
+                (try! (as-contract (stx-transfer? agent-commission tx-sender some-agent)))
+                (map-set agents some-agent 
+                    (merge (default-to {commission-rate: u0, total-volume: u0, active: false, supported-currencies: (list), reputation: u0} (map-get? agents some-agent))
+                           {total-volume: (+ (get total-volume (default-to {commission-rate: u0, total-volume: u0, active: false, supported-currencies: (list), reputation: u0} (map-get? agents some-agent))) amount)}))
+            )
+            true
+        )
+        
+        (let (
+            (new-executions (+ (get total-executions schedule-data) u1))
+            (new-budget (- (get remaining-budget schedule-data) total-cost))
+            (is-still-active (and (< new-executions (get max-executions schedule-data)) (>= new-budget total-cost)))
+        )
+            (map-set recurring-schedules schedule-id 
+                (merge schedule-data {
+                    next-execution-block: (+ current-block (get interval-blocks schedule-data)),
+                    last-execution-block: current-block,
+                    total-executions: new-executions,
+                    remaining-budget: new-budget,
+                    active: is-still-active
+                })
+            )
+        )
+        
+        (var-set total-volume (+ (var-get total-volume) amount))
+        (var-set total-fees-collected (+ (var-get total-fees-collected) calculated-fee))
+        (update-user-stats sender recipient amount)
+        (ok true)
+    )
+)
+
+(define-public (cancel-recurring-schedule (schedule-id uint))
+    (let (
+        (schedule-data (unwrap! (map-get? recurring-schedules schedule-id) ERR_SCHEDULE_NOT_FOUND))
+        (sender (get sender schedule-data))
+        (remaining-budget (get remaining-budget schedule-data))
+    )
+        (asserts! (is-eq tx-sender sender) ERR_UNAUTHORIZED)
+        (asserts! (get active schedule-data) ERR_SCHEDULE_INACTIVE)
+        
+        (if (> remaining-budget u0)
+            (begin
+                (try! (as-contract (stx-transfer? remaining-budget tx-sender sender)))
+                true
+            )
+            true
+        )
+        
+        (map-set recurring-schedules schedule-id 
+            (merge schedule-data {
+                active: false,
+                remaining-budget: u0
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (pause-recurring-schedule (schedule-id uint))
+    (let (
+        (schedule-data (unwrap! (map-get? recurring-schedules schedule-id) ERR_SCHEDULE_NOT_FOUND))
+        (sender (get sender schedule-data))
+    )
+        (asserts! (is-eq tx-sender sender) ERR_UNAUTHORIZED)
+        (asserts! (get active schedule-data) ERR_SCHEDULE_INACTIVE)
+        
+        (map-set recurring-schedules schedule-id 
+            (merge schedule-data {active: false})
+        )
+        (ok true)
+    )
+)
+
+(define-public (resume-recurring-schedule (schedule-id uint))
+    (let (
+        (schedule-data (unwrap! (map-get? recurring-schedules schedule-id) ERR_SCHEDULE_NOT_FOUND))
+        (sender (get sender schedule-data))
+        (calculated-fee (calculate-fee (get amount schedule-data)))
+        (total-cost (+ (get amount schedule-data) calculated-fee))
+    )
+        (asserts! (is-eq tx-sender sender) ERR_UNAUTHORIZED)
+        (asserts! (not (get active schedule-data)) ERR_TRANSFER_ALREADY_COMPLETED)
+        (asserts! (< (get total-executions schedule-data) (get max-executions schedule-data)) ERR_TRANSFER_ALREADY_COMPLETED)
+        (asserts! (>= (get remaining-budget schedule-data) total-cost) ERR_INSUFFICIENT_BUDGET)
+        
+        (map-set recurring-schedules schedule-id 
+            (merge schedule-data {
+                active: true,
+                next-execution-block: (+ stacks-block-height (get interval-blocks schedule-data))
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (top-up-schedule-budget (schedule-id uint) (additional-budget uint))
+    (let (
+        (schedule-data (unwrap! (map-get? recurring-schedules schedule-id) ERR_SCHEDULE_NOT_FOUND))
+        (sender (get sender schedule-data))
+    )
+        (asserts! (is-eq tx-sender sender) ERR_UNAUTHORIZED)
+        (asserts! (> additional-budget u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= (stx-get-balance sender) additional-budget) ERR_INSUFFICIENT_BALANCE)
+        
+        (try! (stx-transfer? additional-budget sender (as-contract tx-sender)))
+        
+        (map-set recurring-schedules schedule-id 
+            (merge schedule-data {
+                remaining-budget: (+ (get remaining-budget schedule-data) additional-budget)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-recurring-schedule (schedule-id uint))
+    (map-get? recurring-schedules schedule-id)
+)
+
+(define-read-only (get-user-schedules (user principal))
+    (map-get? user-schedules user)
+)
+
+(define-read-only (is-schedule-due (schedule-id uint))
+    (match (map-get? recurring-schedules schedule-id)
+        schedule-data (and 
+            (get active schedule-data)
+            (>= stacks-block-height (get next-execution-block schedule-data))
+            (< (get total-executions schedule-data) (get max-executions schedule-data))
+        )
+        false
+    )
+)
+
+(define-read-only (get-schedule-next-execution (schedule-id uint))
+    (match (map-get? recurring-schedules schedule-id)
+        schedule-data (some (get next-execution-block schedule-data))
+        none
+    )
+)
+
+(define-read-only (calculate-schedule-cost (amount uint) (max-executions uint))
+    (let (
+        (calculated-fee (calculate-fee amount))
+        (per-transfer-cost (+ amount calculated-fee))
+    )
+        (* per-transfer-cost max-executions)
+    )
+)
+
+(define-read-only (get-schedule-stats (schedule-id uint))
+    (match (map-get? recurring-schedules schedule-id)
+        schedule-data (some {
+            total-executions: (get total-executions schedule-data),
+            remaining-executions: (- (get max-executions schedule-data) (get total-executions schedule-data)),
+            remaining-budget: (get remaining-budget schedule-data),
+            active: (get active schedule-data),
+            next-execution-block: (get next-execution-block schedule-data),
+            blocks-until-next: (if (>= stacks-block-height (get next-execution-block schedule-data))
+                u0
+                (- (get next-execution-block schedule-data) stacks-block-height)
+            )
+        })
+        none
+    )
 )
 
 (register-user false)
